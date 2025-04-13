@@ -1,5 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import json
+import random
+import time
 import requests
 import os
 from tqdm import tqdm
@@ -7,7 +9,7 @@ from tqdm import tqdm
 session = requests.Session()
 
 
-def get_all_file(repo_name: str, headers, datasets=True):
+def get_all_file(repo_name: str, headers, datasets=True, folder_name=None):
     if os.path.exists(f"repos/{repo_name}.json"):
         with open(f"repos/{repo_name}.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -26,6 +28,8 @@ def get_all_file(repo_name: str, headers, datasets=True):
         with open(f"repos/{repo_name}.txt", "r", encoding="utf-8") as f:
             for line in f:
                 filename, url = line.strip().split("\t")
+                if folder_name and folder_name not in filename:
+                    continue
                 all_files.append({"filename": filename, "url": url})
     else:
         if "siblings" in data:
@@ -35,46 +39,98 @@ def get_all_file(repo_name: str, headers, datasets=True):
                         url = f"https://huggingface.co/datasets/{repo_name}/resolve/main/{file['rfilename']}"
                     else:
                         url = f"https://huggingface.co/{repo_name}/resolve/main/{file['rfilename']}"
+                    if folder_name and folder_name not in file['rfilename']:
+                        continue
                     f.write(f"{file['rfilename']}\t{url}\n")
                     all_files.append({"filename": file['rfilename'], "url": url})
     return all_files
 
 
-# 添加多线程下载与进度条
+# def download_file(url, file_name, save_path, headers):
+#     if os.path.exists(f"{save_path}/{file_name}"):
+#         print(f"{file_name} already exists")
+#         return
+#     os.makedirs(os.path.dirname(f"{save_path}/{file_name}"), exist_ok=True)
+#     with session.get(url, stream=True, headers=headers) as r:
+#         r.raise_for_status()
+#         total_length = int(r.headers.get('content-length'))
+#         with open(f"{save_path}/{file_name}", "wb") as f:
+#             with tqdm(total=total_length, unit='B', unit_scale=True, unit_divisor=1024, desc=f"Downloading {file_name}") as pbar:
+#                 for chunk in r.iter_content(chunk_size=8192):
+#                     if chunk:
+#                         f.write(chunk)
+#                         pbar.update(len(chunk))
+#     print(f"Downloaded {file_name}")
+#     return
 def download_file(url, file_name, save_path, headers):
-    if os.path.exists(f"{save_path}/{file_name}"):
-        print(f"{file_name} already exists")
-        return
-    os.makedirs(os.path.dirname(f"{save_path}/{file_name}"), exist_ok=True)
-    with session.get(url, stream=True, headers=headers) as r:
+    file_path = f"{save_path}/{file_name}"
+    resume_byte = 0
+
+    # 检查文件是否已部分下载
+    if os.path.exists(file_path):
+        resume_byte = os.path.getsize(file_path)
+        print(f"Resuming download for {file_name} from byte {resume_byte}")
+
+    # 创建目录
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    # 设置 Range 头以支持断点续传
+    local_headers = headers.copy()
+    if resume_byte > 0:
+        local_headers['Range'] = f"bytes={resume_byte}-"
+
+    with session.get(url, stream=True, headers=local_headers) as r:
+        # 检查响应状态码
+        if r.status_code == 416:  # 文件已完整下载
+            print(f"{file_name} is already fully downloaded")
+            return
         r.raise_for_status()
-        total_length = int(r.headers.get('content-length'))
-        with open(f"{save_path}/{file_name}", "wb") as f:
-            with tqdm(total=total_length, unit='B', unit_scale=True, unit_divisor=1024, desc=f"Downloading {file_name}") as pbar:
+
+        # 获取文件总大小
+        total_length = int(r.headers.get('content-length', 0)) + resume_byte
+
+        # 打开文件并写入数据
+        with open(file_path, "ab") as f:
+            with tqdm(total=total_length, initial=resume_byte, unit='B', unit_scale=True, unit_divisor=1024, desc=f"Downloading {file_name}") as pbar:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
                         pbar.update(len(chunk))
+
     print(f"Downloaded {file_name}")
     return
 
 
-def download_repo(repo: str, save_path: str, headers, datasets=True):
-    all_files = get_all_file(f"{repo}", headers, datasets)
-
+def download_repo(repo: str, save_path: str, headers, datasets=True, folder_name=None, retry=10):
+    retry_count = 0
+    all_files = []
+    while retry_count < retry:
+        try:
+            all_files = get_all_file(f"{repo}", headers, datasets, folder_name)
+            break
+        except Exception as e:
+            print(f"Error fetching file list: {e}")
+            retry_count += 1
+            if retry_count == retry:
+                print("Max retries reached. Exiting.")
+                return
     for file_data in all_files:
-        file_name = file_data["filename"]
-        url = file_data["url"]
-        file_path = os.path.join(save_path, file_name)
-        if os.path.exists(file_path):
-            if file_path.endswith(".tar") and os.path.getsize(file_path) < 1024 * 1024:
-                os.remove(file_path)
-            else:
-                print(f"{file_name} already exists")
-                continue
-        print(f"Start Download {file_name}")
-        download_file(url, file_name, save_path, headers)
-        print(f"Downloaded {file_name}")
+        retry_count = 0
+        while retry_count < retry:
+            try:
+                file_name = file_data["filename"]
+                url = file_data["url"]
+                print(f"Start Download {file_name}")
+                download_file(url, file_name, save_path, headers)
+                print(f"Downloaded {file_name}")
+                break
+            except Exception as e:
+                print(f"Error downloading {file_name}: {e}")
+                retry_count += 1
+                time.sleep(random.uniform(1, 5) * retry_count)  # 等待一段时间后重试
+                if retry_count == retry:
+                    print(f"Max retries reached for {file_name}. Exiting.")
+                    break
     print("Download completed")
 
 
